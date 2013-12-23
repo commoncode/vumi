@@ -1,5 +1,7 @@
 # -*- test-case-name: vumi.transports.twitter.tests.test_twitter -*-
 
+import json
+
 from twisted.python import log
 from twisted.internet.defer import inlineCallbacks
 from twisted.internet import task
@@ -12,12 +14,36 @@ from vumi.message import TransportUserMessage
 from vumi.persist.txredis_manager import TxRedisManager
 
 
+def _parse_update_response(response_body):
+    return json.loads(response_body)['id_str']
+
+
+class FragileUpdatePatchedTwitter(twitter.Twitter):
+    """
+    This is a fragile hack using twitter.Twitter to post status updates using
+    the v1.1 REST API. It has been manually tested and works as of 2013-12-23,
+    but we really should be replacing this horrible client library with a
+    different one instead of balancing additional hacks on it.
+    """
+
+    def update(self, status, source=None, params={}):
+        # XXX: This assumes the private internals of Twitter.twitter do what we
+        #      expect.
+        params = params.copy()
+        params['status'] = status
+        if source:
+            params['source'] = source
+        d = self._Twitter__post('/statuses/update.json', params)
+        return d.addCallback(_parse_update_response)
+
+
 class TwitterTransport(Transport):
     """Twitter transport."""
 
     transport_type = 'twitter'
 
     _twitter_class = twitter.TwitterFeed
+    _twitter_post_class = FragileUpdatePatchedTwitter
 
     def validate_config(self):
         self.consumer_key = self.config['consumer_key']
@@ -29,6 +55,7 @@ class TwitterTransport(Transport):
         self.terms = set(self.config.get('terms'))
         self.check_replies_interval = int(self.config.get(
                             'check_replies_interval', 60))
+        self.allow_post = self.config.get('allow_post', False)
 
     @inlineCallbacks
     def setup_transport(self):
@@ -40,6 +67,10 @@ class TwitterTransport(Transport):
         yield self.start_tracking_terms()
         if self.check_replies_interval > 0:
             self.start_checking_for_replies()
+        if self.allow_post:
+            self.twitter_post = self._twitter_post_class(
+                consumer=consumer, token=token,
+                base_url="https://api.twitter.com/1.1")
 
     @inlineCallbacks
     def start_tracking_terms(self):
@@ -52,8 +83,15 @@ class TwitterTransport(Transport):
         self.check_replies.start(self.check_replies_interval)
 
     def teardown_transport(self):
-        if self.check_replies.running:
+        # Stop our reply checking, if any.
+        if hasattr(self, 'check_replies') and self.check_replies.running:
             self.check_replies.stop()
+
+        # Stop our filter stream, if any.
+        if hasattr(self, 'stream'):
+            if getattr(self.stream, 'transport', None) is not None:
+                self.stream.transport.stopProducing()
+
         return self.redis._close()
 
     def check_for_replies(self):
@@ -67,8 +105,13 @@ class TwitterTransport(Transport):
                 moment.
         """
         log.msg("Twitter transport sending %r" % (message,))
+        if not self.allow_post:
+            yield self.publish_nack(user_message_id=message['message_id'],
+                                    sent_message_id=message['message_id'],
+                                    reason="Posting to twitter is disabled.")
+            return
         try:
-            post_id = yield self.twitter.update(message['content'])
+            post_id = yield self.twitter_post.update(message['content'])
             yield self.publish_ack(user_message_id=message['message_id'],
                                 sent_message_id=post_id)
         except error.Error, e:

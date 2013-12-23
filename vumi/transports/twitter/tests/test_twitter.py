@@ -21,6 +21,7 @@ class FakeTwitter(object):
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
+        self.raise_update_error = False
 
     def update(self, content):
         if self.raise_update_error:
@@ -57,11 +58,13 @@ class TestTwitterTransport(VumiTestCase):
             'access_token': 'token1',
             'access_token_secret': 'tokensecret1',
             'terms': ['some', 'trending', 'topic'],
+            'allow_post': True,
         }
         self.tx_helper = self.add_helper(TransportHelper(TwitterTransport))
         self.transport = yield self.tx_helper.get_transport(
             config, start=False)
         self.transport._twitter_class = FakeTwitter
+        self.transport._twitter_post_class = FakeTwitter
         yield self.transport.startWorker()
 
     @inlineCallbacks
@@ -111,8 +114,25 @@ class TestTwitterTransport(VumiTestCase):
                          TransportUserMessage.SESSION_NONE)
 
     @inlineCallbacks
-    def test_nack(self):
-        self.transport.twitter.raise_update_error = True
+    def test_outbound_disabled(self):
+        self.transport.allow_post = False
+        msg = yield self.tx_helper.make_dispatch_outbound("outbound")
+        [nack] = yield self.tx_helper.wait_for_dispatched_events(1)
+        self.assertEqual(nack['user_message_id'], msg['message_id'])
+        self.assertEqual(nack['sent_message_id'], msg['message_id'])
+        self.assertEqual(nack['nack_reason'],
+            'Posting to twitter is disabled.')
+
+    @inlineCallbacks
+    def test_outbound(self):
+        msg = yield self.tx_helper.make_dispatch_outbound("outbound")
+        [ack] = yield self.tx_helper.wait_for_dispatched_events(1)
+        self.assertEqual(ack['user_message_id'], msg['message_id'])
+        self.assertEqual(ack['sent_message_id'], 'post-id')
+
+    @inlineCallbacks
+    def test_outbound_fail_whale(self):
+        self.transport.twitter_post.raise_update_error = True
         msg = yield self.tx_helper.make_dispatch_outbound("outbound")
         [nack] = yield self.tx_helper.wait_for_dispatched_events(1)
         self.assertEqual(nack['user_message_id'], msg['message_id'])
